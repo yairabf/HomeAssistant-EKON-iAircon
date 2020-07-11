@@ -160,7 +160,7 @@ MAP_FAN_HASS_TO_EKON = {
 }
 
 @asyncio.coroutine
-def async_setup_platform(hass, config, async_add_devices, discovery_info=None):
+async def async_setup_platform(hass, config, async_add_devices, discovery_info=None):
     _LOGGER.info('Setting up Ekon climate platform')
     name = config.get(CONF_NAME)
     base_url = config.get(CONF_URL_BASE)
@@ -170,7 +170,8 @@ def async_setup_platform(hass, config, async_add_devices, discovery_info=None):
     name_mapping = config.get(CONF_NAME_MAPPING)
 
     _LOGGER.info('Creating Ekon climate controller')
-    EkonClimateController(hass, async_add_devices, name, base_url, username, password, name_mapping)
+    controller = EkonClimateController(hass, async_add_devices, name, base_url, username, password, name_mapping)
+    await controller.async_load_init_data()
 
 
 class EkonClimateController():
@@ -184,16 +185,19 @@ class EkonClimateController():
         self._username = username
         self._password = password
         self._devices = {}
+        self._name_mapping = name_mapping
 
-        # Now since I don't have a clue in how to develop inside HASS, I took some ideas and implementation from HASS-sonoff-ewelink
-        if not self.do_login():
+    async def async_load_init_data(self):
+         # Now since I don't have a clue in how to develop inside HASS, I took some ideas and implementation from HASS-sonoff-ewelink
+        if not await self.async_do_login():
             return
 
-        for dev_raw in self.query_devices():
+        devices = await self.async_query_devices()
+        for dev_raw in devices:
             dev_name = "Ekon" + str(dev_raw['id'])
             # Note: I Suck @ python :P
 
-            matching_items = list(filter(lambda x: int(x['id'])==int(dev_raw['id']), name_mapping))
+            matching_items = list(filter(lambda x: int(x['id'])==int(dev_raw['id']), self._name_mapping))
             if len(matching_items)>0:
                 dev_name = matching_items[0]['name']
 
@@ -202,8 +206,11 @@ class EkonClimateController():
                 dev_raw[EKON_PROP_ONOFF], dev_raw[EKON_PROP_MODE], dev_raw[EKON_PROP_FAN], dev_raw[EKON_PROP_TARGET_TEMP], dev_raw[EKON_PROP_ENVIROMENT_TEMP], dev_raw['envTempShow'], dev_raw['light'], dev_name
             )
             self._devices[dev_raw['mac']] = newdev
-            async_add_devices([newdev])
+            self._async_add_devices([newdev])
 
+    
+    async def async_query_devices(self):
+        return await self.hass.async_add_executor_job(self.query_devices)
 
     def query_devices(self):
         """json response .... 'attachment': [< array of hvacs >]"""
@@ -214,10 +221,14 @@ class EkonClimateController():
         if(result.status_code!=200):
             _LOGGER.error ("Error query_devices")
             return False
+        _LOGGER.debug(result.content)
         attch = json.loads(result.content)['attachment']
         _LOGGER.info ("query_devices")
         _LOGGER.info (attch)
         return attch  
+
+    async def async_do_login(self):
+        return await self.hass.async_add_executor_job(self.do_login)
 
     def do_login(self):
         url = self._base_url + 'j_spring_security_check'
