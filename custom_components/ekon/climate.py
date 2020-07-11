@@ -49,23 +49,28 @@ DEFAULT_BASE_URL = "https://www.airconet.info/"
 CONF_USERNAME = 'username'
 CONF_PASSWORD = 'password'
 CONF_URL_BASE = 'base_url'
+#CONF_NAME_MAPPING_METHOD = 'name_mapping_method'
+CONF_NAME_MAPPING = 'name_mapping'
 DEFAULT_TIMEOUT = 10
 
 # What I recall are the min and max for the HVAC
 MIN_TEMP = 16
 MAX_TEMP = 30
 
-# fixed values in ekon mode lists
+# fixed values in elon mode lists
 HVAC_MODES = [HVAC_MODE_AUTO, HVAC_MODE_COOL, HVAC_MODE_DRY, HVAC_MODE_FAN_ONLY, HVAC_MODE_HEAT, HVAC_MODE_OFF]
 
 FAN_MODES = [FAN_AUTO, FAN_LOW, FAN_MEDIUM, FAN_HIGH]
 
+# Since we're creating a platform for integration `Climate` extend the schema
 PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend({
     vol.Optional(CONF_NAME, default=DEFAULT_NAME): cv.string,
     vol.Optional(CONF_URL_BASE, default=DEFAULT_BASE_URL): cv.string,
     vol.Required(CONF_USERNAME): cv.string,
     vol.Required(CONF_PASSWORD): cv.string,
-    vol.Optional(CONF_TIMEOUT, default=DEFAULT_TIMEOUT): cv.positive_int
+    vol.Optional(CONF_TIMEOUT, default=DEFAULT_TIMEOUT): cv.positive_int,
+    #vol.Optional(CONF_NAME_MAPPING_METHOD, default=''): cv:string
+    vol.Optional(CONF_NAME_MAPPING, default=[]): cv.ensure_list
 })
 
 EKON_PROP_ONOFF = 'onoff' 
@@ -162,14 +167,15 @@ def async_setup_platform(hass, config, async_add_devices, discovery_info=None):
     timeout = config.get(CONF_TIMEOUT)
     username = config.get(CONF_USERNAME)
     password = config.get(CONF_PASSWORD)
+    name_mapping = config.get(CONF_NAME_MAPPING)
 
     _LOGGER.info('Creating Ekon climate controller')
-    EkonClimateController(hass, async_add_devices, name, base_url, username, password)
+    EkonClimateController(hass, async_add_devices, name, base_url, username, password, name_mapping)
 
 
 class EkonClimateController():
     """Ekon user account, inside this account there are all the ACs""" 
-    def __init__(self, hass, async_add_devices, name, base_url, username, password):
+    def __init__(self, hass, async_add_devices, name, base_url, username, password, name_mapping):
         self._http_session = requests.Session()
         self.hass = hass
         self._async_add_devices = async_add_devices
@@ -184,9 +190,16 @@ class EkonClimateController():
             return
 
         for dev_raw in self.query_devices():
-            _LOGGER.info('Adding Ekon climate device to hass')
+            dev_name = "Ekon" + str(dev_raw['id'])
+            # Note: I Suck @ python :P
+
+            matching_items = list(filter(lambda x: int(x['id'])==int(dev_raw['id']), name_mapping))
+            if len(matching_items)>0:
+                dev_name = matching_items[0]['name']
+
+            _LOGGER.info('Adding Gree climate device to hass')
             newdev = EkonClimate(self, dev_raw['mac'], dev_raw['id'],
-                dev_raw[EKON_PROP_ONOFF], dev_raw[EKON_PROP_MODE], dev_raw[EKON_PROP_FAN], dev_raw[EKON_PROP_TARGET_TEMP], dev_raw[EKON_PROP_ENVIROMENT_TEMP], dev_raw['envTempShow'], dev_raw['light']
+                dev_raw[EKON_PROP_ONOFF], dev_raw[EKON_PROP_MODE], dev_raw[EKON_PROP_FAN], dev_raw[EKON_PROP_TARGET_TEMP], dev_raw[EKON_PROP_ENVIROMENT_TEMP], dev_raw['envTempShow'], dev_raw['light'], dev_name
             )
             self._devices[dev_raw['mac']] = newdev
             async_add_devices([newdev])
@@ -195,7 +208,7 @@ class EkonClimateController():
     def query_devices(self):
         """json response .... 'attachment': [< array of hvacs >]"""
         """ Each hvac is like """
-        # [{'id': xxx, 'mac': 'xxxxxxxxxxxx', 'onoff': 85, 'light': 0, 'mode': 17, 'fan': 1, 'envTemp': 23, 'envTempShow': 23, 'tgtTemp': 24}]
+        # [{'id': 944, 'mac': '60019443DD92', 'onoff': 85, 'light': 0, 'mode': 17, 'fan': 1, 'envTemp': 23, 'envTempShow': 23, 'tgtTemp': 24}]
         url = self._base_url + '/dev/allStatus'
         result = self._http_session.get(url)
         if(result.status_code!=200):
@@ -246,11 +259,11 @@ class EkonClimateController():
 
 class EkonClimate(ClimateEntity):
     #'onoff': 85, 'light': 0, 'mode': 17, 'fan': 1, 'envTemp': 23, 'envTempShow': 23, 'tgtTemp': 24
-    def __init__(self, controller, _mac_addr, id, onoff, mode, fan, target_temp, env_temp, env_temp_show, light):
+    def __init__(self, controller, _mac_addr, id, onoff, mode, fan, target_temp, env_temp, env_temp_show, light, name):
         _LOGGER.info('Initialize the Ekon climate device')
         self._controller = controller
         self._id = id
-        self._name = "Ekon" + str(id)
+        self._name = name
         self._mac_addr = _mac_addr
 
         self._target_temperature_step = 1
@@ -332,7 +345,7 @@ class EkonClimate(ClimateEntity):
             _LOGGER.error(result.content)
             _LOGGER.error("SyncAndSet (properties)error")
             return False
-        # Damn server has delay/race condition syncing the value we just set, so that it will be the one read next time
+        # Damn server has delay syncing the value we just set, so that it will be the one read next time
         # In other words, if we setHvac and getDevice immidiatly, values might be the old one, so HA would look like it hadn't changed
         time.sleep(1)
         # TODO: Check response json returnCode {"returnCode":0,"values":null} ; 0 OK, -72 Device offiline; -73 see belo. other fail 
@@ -363,11 +376,43 @@ class EkonClimate(ClimateEntity):
         """
         _LOGGER.info(result.content)
         return True
+        # I Think there's a race condition from the backend db side, I guess this request overwrites the previues one.
+        # Son only turn on or off if there was a change
+        """        
+                url = self._controller._base_url + 'dev/switchHvac/' + self._ekon_state_obj["mac"] + '?on='
+
+                is_on = self._ekon_state_obj[EKON_PROP_ONOFF] == EKON_VALUE_ON
+                on_off_changed = ((self._last_on_state==True) and (self._ekon_state_obj[EKON_PROP_ONOFF] != EKON_VALUE_ON)) \
+                    or ( (self._last_on_state==False) and (self._ekon_state_obj[EKON_PROP_ONOFF] == EKON_VALUE_ON) )
+                if on_off_changed:
+                    from time import sleep
+                    sleep(2) # Does this help with the race condition?
+                    _LOGGER.info("onoff changed is_on: %r" % is_on)
+                    if is_on:
+                        self._last_on_state = True
+                        url = url + 'True'
+                    else:
+                        self._last_on_state = False
+                        url = url + 'False'
+
+                    result = self._controller._http_session.get(url)
+                    if(result.status_code!=200):
+                        _LOGGER.error(result.content)
+                        _LOGGER.error("SyncAndSet (onoff)error")
+                        return False
+        """
+        return True
     
     def GetAndSync(self):
         self._controller.refreshACs()
         # Sync in
         self.SyncEkonObjToSelf()
+
+    """
+        def GreeGetValues(self, propertyNames):
+            jsonPayloadToSend = '{"cid":"app","i":0,"pack":"' + base64.b64encode(self.CIPHER.encrypt(self.Pad('{"cols":' + simplejson.dumps(propertyNames) + ',"mac":"' + str(self._mac_addr) + '","t":"status"}').encode("utf8"))).decode('utf-8') + '","t":"pack","tcid":"' + str(self._mac_addr) + '","uid":{}'.format(self._uid) + '}'
+            return self.FetchResult(self.CIPHER, self._ip_addr, self._port, self._timeout, jsonPayloadToSend)['dat']
+    """
     
     def SendStateToAc(self, timeout):
         _LOGGER.info('Start sending state to HVAC')
@@ -380,6 +425,7 @@ class EkonClimate(ClimateEntity):
             'tgtTemp': self._ekon_state_obj['tgtTemp']
         }
         url = self._controller._base_url + 'dev/setHvac'
+        # Requests automatically put proper content type of json
         result = self._controller._http_session.post(json=obj)
         if(result.status_code!=200):
             _LOGGER.error("SendStateToAc faild")
