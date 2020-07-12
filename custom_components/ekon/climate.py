@@ -8,7 +8,9 @@ import socket
 import base64
 import re
 import sys
-
+import random
+import websocket
+from urllib import parse
 import asyncio
 import logging
 import binascii
@@ -171,6 +173,7 @@ async def async_setup_platform(hass, config, async_add_devices, discovery_info=N
 
     _LOGGER.info('Creating Ekon climate controller')
     controller = EkonClimateController(hass, async_add_devices, name, base_url, username, password, name_mapping)
+    
     await controller.async_load_init_data()
 
 
@@ -183,6 +186,7 @@ class EkonClimateController():
         self._name = name
         self._base_url = base_url
         self._username = username
+        self._ws_sucsess = False
         self._password = password
         self._devices = {}
         self._name_mapping = name_mapping
@@ -207,6 +211,32 @@ class EkonClimateController():
             )
             self._devices[dev_raw['mac']] = newdev
             self._async_add_devices([newdev])
+
+        # Not yet implemented
+        # self._ws_sucsess = await self.async_setup_ws()
+
+    async def async_setup_ws(self):
+        headers = {}
+        # SO 58866803
+        headers['Sec-WebSocket-Key'] = str(base64.b64encode(bytes([random.randint(0, 255) for _ in range(16)])), 'ascii')
+        headers['Sec-WebSocket-Version'] = '13'
+        headers['Upgrade'] = 'websocket'
+        cookies = self._http_session.cookies.get_dict()
+        # Build WS url from https
+        parsed = parse.urlparse(self._base_url + '/ws')
+        parts = list(parsed)
+        # replace https with wss
+        parts[0] = 'wss'
+        wssaddr = parse.urlunparse(parts)
+        # wssaddr is: "wss://www.airconet.xyz/ws"
+        ws = websocket.WebSocketApp(wssaddr, header=headers, cookie="; ".join(["%s=%s" %(i, j) for i, j in cookies.items()]))
+        # TODO:
+        #   - add callback, I Guess..?
+        #   - In callback: parse the recived json, (multiple hvacs?) and update Device accordingly
+        #   - + Issue HA to load device values (schedule_update_ha_state ?)
+        #   - Set a timer to send 'Blha' every 30 seconds on socket
+        #   - On error: ???
+        return True
 
     
     async def async_query_devices(self):
@@ -268,6 +298,13 @@ class EkonClimateController():
             ekon_state[EKON_PROP_ENVIROMENT_TEMP] = dev_raw[EKON_PROP_ENVIROMENT_TEMP]
             ekon_state[EKON_PROP_TARGET_TEMP] = dev_raw[EKON_PROP_TARGET_TEMP]
 
+class EkonClimateValues():
+    def __init__(self):
+        self._target_temperature = 0
+        self._current_temperature = 0
+        self._fan_mode = 0
+        self._hvac_mode = 0
+
 class EkonClimate(ClimateEntity):
     #'onoff': 85, 'light': 0, 'mode': 17, 'fan': 1, 'envTemp': 23, 'envTempShow': 23, 'tgtTemp': 24
     def __init__(self, controller, _mac_addr, id, onoff, mode, fan, target_temp, env_temp, env_temp_show, light, name):
@@ -290,12 +327,23 @@ class EkonClimate(ClimateEntity):
             'envTemp': env_temp, # RO
             'tgtTemp': target_temp, # RO
         }
-        
+
         # Hack? see later
         self._last_on_state=False
         if onoff != EKON_VALUE_ON:
             self._last_on_state=False
         self.SyncEkonObjToSelf()
+
+        # For set_xxxx functions; create a shadow instance of the Ekon and local values
+        self._set_values = EkonClimateValues()
+        self.cpy_current_to_set_to()
+
+    def cpy_current_to_set_to(self):
+        self._set_values._target_temperature = self._target_temperature
+        self._set_values._current_temperature = self._current_temperature
+        self._set_values._hvac_mode = self._hvac_mode
+        self._set_values._fan_mode = self._fan_mode
+        self._set_obj = self._ekon_state_obj.copy()
 
     def SyncEkonObjToSelf(self):
         self._current_temperature = self._ekon_state_obj[EKON_PROP_ENVIROMENT_TEMP]
@@ -318,14 +366,14 @@ class EkonClimate(ClimateEntity):
 
     def SyncSelfToEkonObj(self):
         _LOGGER.info("SyncSelfToEkonObj")
-        self._ekon_state_obj[EKON_PROP_TARGET_TEMP] = self._target_temperature
+        self._set_obj[EKON_PROP_TARGET_TEMP] = self._set_values._target_temperature
 
         if self._hvac_mode == HVAC_MODE_OFF:
-            self._ekon_state_obj[EKON_PROP_ONOFF] = EKON_VALUE_OFF
+            self._set_obj[EKON_PROP_ONOFF] = EKON_VALUE_OFF
         else:
-            self._ekon_state_obj[EKON_PROP_ONOFF] = EKON_VALUE_ON
-            self._ekon_state_obj[EKON_PROP_MODE] = MAP_MODE_HASS_TO_EKON[self._hvac_mode]       
-        self._ekon_state_obj[EKON_PROP_FAN] = MAP_FAN_HASS_TO_EKON[self._fan_mode]
+            self._set_obj[EKON_PROP_ONOFF] = EKON_VALUE_ON
+            self._set_obj[EKON_PROP_MODE] = MAP_MODE_HASS_TO_EKON[self._set_values._hvac_mode]       
+        self._set_obj[EKON_PROP_FAN] = MAP_FAN_HASS_TO_EKON[self._set_values._fan_mode]
 
     def TurnOnOff(self, state):
         url = self._controller._base_url + 'dev/switchHvac/' + self._ekon_state_obj["mac"] + '?on='
@@ -346,12 +394,13 @@ class EkonClimate(ClimateEntity):
         return True
         
     def SyncAndSet(self):
+        # We get here after calling code changed fan / temp / mode of self;
         self.SyncSelfToEkonObj()
         url = self._controller._base_url + 'dev/setHvac'
         # mac, onoff, mode, fan, envtemp, tgttemp, 
         _LOGGER.info('Syncing to remote, state')
         _LOGGER.info(str(json.dumps(self._ekon_state_obj)))
-        result = self._controller._http_session.post(url, json=self._ekon_state_obj)
+        result = self._controller._http_session.post(url, json=self._set_obj)
         if(result.status_code!=200):
             _LOGGER.error(result.content)
             _LOGGER.error("SyncAndSet (properties)error")
@@ -392,6 +441,8 @@ class EkonClimate(ClimateEntity):
         self._controller.refreshACs()
         # Sync in
         self.SyncEkonObjToSelf()
+        # Overwrite the request-to-set values with updated one
+        self.cpy_current_to_set_to()
 
     def SendStateToAc(self, timeout):
         _LOGGER.info('Start sending state to HVAC')
@@ -415,7 +466,7 @@ class EkonClimate(ClimateEntity):
     def should_poll(self):
         _LOGGER.info('should_poll()')
         # Return the polling state.
-        return True
+        return not self._controller._ws_sucsess
 
     def update(self):
         _LOGGER.info('update()')
@@ -499,7 +550,7 @@ class EkonClimate(ClimateEntity):
         # Set new target temperatures.
         if kwargs.get(ATTR_TEMPERATURE) is not None:
             # do nothing if temperature is none
-            self._target_temperature = int(kwargs.get(ATTR_TEMPERATURE))
+            self._set_values._target_temperature = int(kwargs.get(ATTR_TEMPERATURE))
             self.SyncAndSet()
             # I'm not sure what this does in POLLING mode (Should poll True), But I guess it would make HASS
             # Perform a poll update() and refresh new data from the server
@@ -508,7 +559,7 @@ class EkonClimate(ClimateEntity):
     def set_fan_mode(self, fan):
         _LOGGER.info('set_fan_mode(): ' + str(fan))
         # Set the fan mode.
-        self._fan_mode = fan
+        self._set_values._fan_mode = fan
         self.SyncAndSet()
         self.schedule_update_ha_state()
 
@@ -520,7 +571,7 @@ class EkonClimate(ClimateEntity):
         
         # Set new operation mode.
         prev_mode = self._hvac_mode
-        self._hvac_mode = hvac_mode
+        self._set_values._hvac_mode = hvac_mode
         self.SyncAndSet()
         # And only after turn on? if needed
         if prev_mode==HVAC_MODE_OFF:
