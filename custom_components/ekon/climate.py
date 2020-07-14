@@ -16,6 +16,8 @@ import logging
 import binascii
 import os.path
 import voluptuous as vol
+import threading
+
 import homeassistant.helpers.config_validation as cv
 
 from homeassistant.components.climate import (ClimateEntity, PLATFORM_SCHEMA)
@@ -213,8 +215,39 @@ class EkonClimateController():
             self._async_add_devices([newdev])
 
         # Not yet implemented
-        # self._ws_sucsess = await self.async_setup_ws()
+        await self.async_setup_ws()
 
+    def ws_start_ping_thread(self):
+        #asyncio.get_event_loop().run_until_complete(async_ws_ping_thread)
+        #self.hass.async_create_task(self.async_ws_ping_thread())
+        #task = asyncio.create_task(self.async_ws_ping_thread())
+        # Again, Could someone please explain how can I schedule something to run on hass in a specific time??
+        #self._ws_ping_thread = threading.Thread(target=self.async_ws_ping_thread)
+        self._ws_ping_thread = threading.Thread(target=lambda : self.async_ws_ping_thread())
+        self._ws_ping_thread.daemon = True
+        self._ws_ping_thread.start()
+
+    def ws_start_reciver_thread(self):
+        # Could someone please explain why python-websocket doesn't offer a non-blocking event-driven WS interface?
+        self._ws_reciver_thread = threading.Thread(target=self._ws.run_forever)
+        self._ws_reciver_thread.daemon = True
+        self._ws_reciver_thread.start()
+
+    def ws_stop_ping_thread(self):
+        self._ws_ping_thread.stop()
+
+    def ws_stop_reciver_thread(self):
+        self._ws_reciver_thread.stop()
+
+    # @asyncio.coroutine
+    def async_ws_ping_thread(self):
+        time.sleep(20)
+        while self._ws_sucsess:
+            #await asyncio.sleep(20)
+            _LOGGER.debug("Sending WS Heartbeat ping")
+            self._ws.send("Hello!")
+            time.sleep(20)
+            
     async def async_setup_ws(self):
         headers = {}
         # SO 58866803
@@ -229,19 +262,54 @@ class EkonClimateController():
         parts[0] = 'wss'
         wssaddr = parse.urlunparse(parts)
         # wssaddr is: "wss://www.airconet.xyz/ws"
-        ws = websocket.WebSocketApp(wssaddr, header=headers, cookie="; ".join(["%s=%s" %(i, j) for i, j in cookies.items()]))
-        # TODO:
-        #   - add callback, I Guess..?
-        #   - In callback: parse the recived json, (multiple hvacs?) and update Device accordingly
-        #   - + Issue HA to load device values (schedule_update_ha_state ?)
-        #   - Set a timer to send 'Blha' every 30 seconds on socket
-        #   - On error: ???
+        _LOGGER.debug("async_setup_ws() - Connecting to WebSocket ws")
+        self._ws = websocket.WebSocketApp(wssaddr, header=headers, cookie="; ".join(["%s=%s" %(i, j) for i, j in cookies.items()]),
+            on_open=lambda ws: self.ws_on_open(ws), # <--- This line is changed
+            on_message=lambda ws, msg: self.ws_on_message (ws, msg),
+            on_error=lambda ws, error: self.ws_on_error(ws, error), # Omittable (msg -> error)
+            on_close=lambda ws: self.ws_on_close(ws)  ) 
+        self.ws_start_reciver_thread()
+        _LOGGER.debug ("async_setup_ws - created handler and ping thread")
         return True
 
+    def ws_on_open(self, ws):
+        _LOGGER.info("ws_on_open() - WebSocket opened")
+        # OK So we don't need to use polling anymore; when HVAC change we will be notified
+        self._ws_sucsess = True
+        # Since we're now connected, start the ping thread (Not a regular WS ping, requires data in message)
+        self.ws_start_ping_thread()
+
+    def ws_on_error(self, ws, error):
+        _LOGGER.error("ws_on_error() - WS Error:")
+        _LOGGER.error(error)
+        self._ws_sucsess = False
+
+    def ws_on_close(self, ws):
+        # Reconnect? woot?
+        _LOGGER.info("ws_on_close() - ws closed")
+        self._ws_sucsess = False
+
+        #Retry?
+        _LOGGER.info("ws_on_close() - Retry WS setup?")
+        self.hass.async_create_task(self.async_setup_ws())
+
+
+    
+    def ws_on_message(self, ws, msg):
+        _LOGGER.debug('ws_on_message() - WS Got message:')
+        _LOGGER.debug(msg)
+        obj = json.loads(msg)
+        if type(obj) == type({}):
+            # Wrap json in array since refreshACsJson accepts HVAC list
+            obj = list([obj])
+        self.refreshACsJson(obj)
+
+        
     
     async def async_query_devices(self):
         return await self.hass.async_add_executor_job(self.query_devices)
 
+    # Returns JSON object
     def query_devices(self):
         """json response .... 'attachment': [< array of hvacs >]"""
         """ Each hvac is like """
@@ -278,9 +346,8 @@ class EkonClimateController():
         _LOGGER.debug('EKON Login Sucsess')
         return True
 
-    def refreshACs(self):
-        self._devices
-        for dev_raw in self.query_devices():
+    def refreshACsJson(self,json):
+        for dev_raw in json:
             """Refresh the only refreshed stuff 
             'mac': _mac_addr, # We won't sync it; 1-time read.
             'onoff': onoff, 
@@ -290,6 +357,7 @@ class EkonClimateController():
             'tgtTemp': target_temp
             """
             _LOGGER.info('(controller) Refreshing HVAC Data')
+            _LOGGER.debug(json)
             dev = self._devices[dev_raw['mac']]
             ekon_state = self._devices[dev_raw['mac']]._ekon_state_obj
             ekon_state[EKON_PROP_FAN] = dev_raw[EKON_PROP_FAN]
@@ -297,6 +365,13 @@ class EkonClimateController():
             ekon_state[EKON_PROP_MODE] = dev_raw[EKON_PROP_MODE]
             ekon_state[EKON_PROP_ENVIROMENT_TEMP] = dev_raw[EKON_PROP_ENVIROMENT_TEMP]
             ekon_state[EKON_PROP_TARGET_TEMP] = dev_raw[EKON_PROP_TARGET_TEMP]
+            self._devices[dev_raw['mac']].SyncEkonObjToSelf()
+            # Overwrite the request-to-set values with updated one
+            self._devices[dev_raw['mac']].cpy_current_to_set_to()
+            self._devices[dev_raw['mac']].schedule_update_ha_state()
+
+    def refreshACs(self):
+        self.refreshACsJson( self.query_devices() )
 
 class EkonClimateValues():
     def __init__(self):
@@ -464,9 +539,10 @@ class EkonClimate(ClimateEntity):
 
     @property
     def should_poll(self):
-        _LOGGER.info('should_poll()')
+        val = not self._controller._ws_sucsess
+        _LOGGER.info('should_poll():' + str(val))
         # Return the polling state.
-        return not self._controller._ws_sucsess
+        return val
 
     def update(self):
         _LOGGER.info('update()')
