@@ -1,3 +1,4 @@
+
 #!/usr/bin/python
 # Do basic imports
 import requests
@@ -9,7 +10,9 @@ import base64
 import re
 import sys
 import random
+import string
 import websocket
+import ssl
 from urllib import parse
 import asyncio
 import logging
@@ -48,7 +51,7 @@ _LOGGER = logging.getLogger(__name__)
 SUPPORT_FLAGS = SUPPORT_TARGET_TEMPERATURE | SUPPORT_FAN_MODE
 
 DEFAULT_NAME = 'EKON Climate'
-DEFAULT_BASE_URL = "https://www.airconet.info/"
+DEFAULT_BASE_URL = "https://www.activate-ac.com/"
 
 CONF_USERNAME = 'username'
 CONF_PASSWORD = 'password'
@@ -56,6 +59,9 @@ CONF_URL_BASE = 'base_url'
 #CONF_NAME_MAPPING_METHOD = 'name_mapping_method'
 CONF_NAME_MAPPING = 'name_mapping'
 DEFAULT_TIMEOUT = 10
+CONF_TEMPERATURE_SENSOR = 'temperature_sensor'
+CONF_HUMIDITY_SENSOR = 'humidity_sensor'
+CONF_POWER_SENSOR = 'power_sensor'
 
 # What I recall are the min and max for the HVAC
 MIN_TEMP = 16
@@ -74,7 +80,9 @@ PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend({
     vol.Required(CONF_PASSWORD): cv.string,
     vol.Optional(CONF_TIMEOUT, default=DEFAULT_TIMEOUT): cv.positive_int,
     #vol.Optional(CONF_NAME_MAPPING_METHOD, default=''): cv:string
-    vol.Optional(CONF_NAME_MAPPING, default=[]): cv.ensure_list
+    vol.Optional(CONF_NAME_MAPPING, default=[]): cv.ensure_list,
+    vol.Optional(CONF_TEMPERATURE_SENSOR): cv.entity_id,
+    vol.Optional(CONF_HUMIDITY_SENSOR): cv.entity_id
 })
 
 EKON_PROP_ONOFF = 'onoff' 
@@ -172,18 +180,20 @@ async def async_setup_platform(hass, config, async_add_devices, discovery_info=N
     username = config.get(CONF_USERNAME)
     password = config.get(CONF_PASSWORD)
     name_mapping = config.get(CONF_NAME_MAPPING)
+    temperature_sensor = config.get(CONF_TEMPERATURE_SENSOR)
+    humidity_sensor = config.get(CONF_HUMIDITY_SENSOR)
 
     _LOGGER.info('Creating Ekon climate controller')
-    controller = EkonClimateController(hass, async_add_devices, name, base_url, username, password, name_mapping)
+    controller = EkonClimateController(hass, async_add_devices, name, base_url, username, password, name_mapping, temperature_sensor, humidity_sensor)
     
     await controller.async_load_init_data()
 
 
 class EkonClimateController():
     """Ekon user account, inside this account there are all the ACs""" 
-    def __init__(self, hass, async_add_devices, name, base_url, username, password, name_mapping):
+    def __init__(self, hass, async_add_devices, name, base_url, username, password, name_mapping, temperature_sensor, humidity_sensor):
         self._http_session = requests.Session()
-        self.hass = hass
+        self._hass = hass
         self._async_add_devices = async_add_devices
         self._name = name
         self._base_url = base_url
@@ -192,6 +202,8 @@ class EkonClimateController():
         self._password = password
         self._devices = {}
         self._name_mapping = name_mapping
+        self._temperature_sensor = temperature_sensor
+        self._humidity_sensor = humidity_sensor
 
     async def async_load_init_data(self):
          # Now since I don't have a clue in how to develop inside HASS, I took some ideas and implementation from HASS-sonoff-ewelink
@@ -209,7 +221,7 @@ class EkonClimateController():
 
             _LOGGER.info('Adding Gree climate device to hass')
             newdev = EkonClimate(self, dev_raw['mac'], dev_raw['id'],
-                dev_raw[EKON_PROP_ONOFF], dev_raw[EKON_PROP_MODE], dev_raw[EKON_PROP_FAN], dev_raw[EKON_PROP_TARGET_TEMP], dev_raw[EKON_PROP_ENVIROMENT_TEMP], dev_raw['envTempShow'], dev_raw['light'], dev_name
+                dev_raw[EKON_PROP_ONOFF], dev_raw[EKON_PROP_MODE], dev_raw[EKON_PROP_FAN], dev_raw[EKON_PROP_TARGET_TEMP], dev_raw[EKON_PROP_ENVIROMENT_TEMP], dev_raw['envTempShow'], dev_raw['light'], dev_name,
             )
             self._devices[dev_raw['mac']] = newdev
             self._async_add_devices([newdev])
@@ -263,7 +275,7 @@ class EkonClimateController():
         wssaddr = parse.urlunparse(parts)
         # wssaddr is: "wss://www.airconet.xyz/ws"
         _LOGGER.debug("async_setup_ws() - Connecting to WebSocket ws")
-        self._ws = websocket.WebSocketApp(wssaddr, header=headers, cookie="; ".join(["%s=%s" %(i, j) for i, j in cookies.items()]),
+        self._ws = websocket.WebSocketApp(wssaddr, sslopt={"cert_reqs": ssl.CERT_NONE}, header=headers, cookie="; ".join(["%s=%s" %(i, j) for i, j in cookies.items()]),
             on_open=lambda ws: self.ws_on_open(ws), # <--- This line is changed
             on_message=lambda ws, msg: self.ws_on_message (ws, msg),
             on_error=lambda ws, error: self.ws_on_error(ws, error), # Omittable (msg -> error)
@@ -291,7 +303,7 @@ class EkonClimateController():
 
         #Retry?
         _LOGGER.info("ws_on_close() - Retry WS setup?")
-        self.hass.async_create_task(self.async_setup_ws())
+        self._hass.async_create_task(self.async_setup_ws())
 
 
     
@@ -307,7 +319,7 @@ class EkonClimateController():
         
     
     async def async_query_devices(self):
-        return await self.hass.async_add_executor_job(self.query_devices)
+        return await self._hass.async_add_executor_job(self.query_devices)
 
     # Returns JSON object
     def query_devices(self):
@@ -326,19 +338,23 @@ class EkonClimateController():
         return attch  
 
     async def async_do_login(self):
-        return await self.hass.async_add_executor_job(self.do_login)
+        return await self._hass.async_add_executor_job(self.do_login)
 
     def do_login(self):
+        captcha = ''.join(random.choice(string.ascii_uppercase + string.digits) for _ in range(7))
         url = self._base_url + 'j_spring_security_check'
         url_params = {
+            'trialCnt': '0',
             'username': self._username,
             'password': self._password,
-            'remember-me': 'true',
+            'remember': 'true',
             'isServer': 'false',
-            'device-id': '02:00:00:00:00:00',
+            # 'device-id': '02:00:00:00:00:00',
+            'logCaptchaInput': captcha,
+            'mainCaptcha_val': captcha,
             'isDebug': 'tRue'
         }
-        result = self._http_session.post(url, params=url_params, data="")
+        result = self._http_session.post(url, verify=False, params=url_params, data="")
         if(result.status_code!=200):
             _LOGGER.error('EKON Login failed! Please check credentials!')
             _LOGGER.error(result.content)
@@ -377,6 +393,7 @@ class EkonClimateValues():
     def __init__(self):
         self._target_temperature = 0
         self._current_temperature = 0
+        self._current_humidity = 0
         self._fan_mode = 0
         self._hvac_mode = 0
 
@@ -388,7 +405,9 @@ class EkonClimate(ClimateEntity):
         self._id = id
         self._name = name
         self._mac_addr = _mac_addr
-
+        self._temperature_sensor = controller._temperature_sensor
+        self._humidity_sensor = controller._temperature_sensor
+        self._hass = controller._hass
         self._target_temperature_step = 1
         # Ekon works with celsius only
         self._unit_of_measurement = TEMP_CELSIUS
@@ -415,14 +434,35 @@ class EkonClimate(ClimateEntity):
 
     def cpy_current_to_set_to(self):
         self._set_values._target_temperature = self._target_temperature
+        self._set_values._current_humidity = self._current_humidity
         self._set_values._current_temperature = self._current_temperature
         self._set_values._hvac_mode = self._hvac_mode
         self._set_values._fan_mode = self._fan_mode
         self._set_obj = self._ekon_state_obj.copy()
 
     def SyncEkonObjToSelf(self):
-        self._current_temperature = self._ekon_state_obj[EKON_PROP_ENVIROMENT_TEMP]
+        
         self._target_temperature = self._ekon_state_obj[EKON_PROP_TARGET_TEMP]
+        if self._temperature_sensor:
+            self._current_temperature = self._hass.states.get(self._temperature_sensor)
+            async_track_state_change(self._hass, self._temperature_sensor, 
+                                     self._async_temp_sensor_changed)
+
+            temp_sensor_state = self._hass.states.get(self._temperature_sensor)
+            if temp_sensor_state and temp_sensor_state.state != STATE_UNKNOWN:
+                self._async_update_temp(temp_sensor_state )
+        else:
+            self._current_temperature = self._ekon_state_obj[EKON_PROP_ENVIROMENT_TEMP]
+        
+        if self._humidity_sensor:
+            self._current_humidity = self._hass.states.get(self._humidity_sensor)
+            async_track_state_change(self._hass, self._humidity_sensor, 
+                                     self._async_humidity_sensor_changed)
+
+            humidity_sensor_state = self._hass.states.get(self._humidity_sensor)
+            if humidity_sensor_state and humidity_sensor_state.state != STATE_UNKNOWN:
+                self._async_update_humidity(humidity_sensor_state)
+
         
         # AFAIK
         self._min_temp = 16
@@ -566,6 +606,12 @@ class EkonClimate(ClimateEntity):
         _LOGGER.info('current_temperature(): ' + str(self._current_temperature))
         # Return the current temperature.
         return self._current_temperature
+    
+    @property
+    def current_humidity(self):
+        _LOGGER.info('current_humidity(): ' + str(self._current_humidity))
+        # Return the current temperature.
+        return self._current_humidity
 
     @property
     def min_temp(self):
@@ -656,7 +702,42 @@ class EkonClimate(ClimateEntity):
 
         self.schedule_update_ha_state()
 
+    async def _async_temp_sensor_changed(self, entity_id, old_state, new_state):
+        """Handle temperature sensor changes."""
+        if new_state is None:
+            return
+
+        self._async_update_temp(new_state)
+        await self.async_update_ha_state()
+
+    async def _async_humidity_sensor_changed(self, entity_id, old_state, new_state):
+        """Handle humidity sensor changes."""
+        if new_state is None:
+            return
+
+        self._async_update_humidity(new_state)
+        await self.async_update_ha_state()
+
+    @callback
+    def _async_update_temp(self, state):
+        """Update thermostat with latest state from temperature sensor."""
+        try:
+            if state.state != STATE_UNKNOWN:
+                self._current_temperature = float(state.state)
+        except ValueError as ex:
+            _LOGGER.error("Unable to update from temperature sensor: %s", ex)
+
+    @callback
+    def _async_update_humidity(self, state):
+        """Update thermostat with latest state from humidity sensor."""
+        try:
+            if state.state != STATE_UNKNOWN:
+                self._current_humidity = float(state.state)
+        except ValueError as ex:
+            _LOGGER.error("Unable to update from humidity sensor: %s", ex)
+            
     @asyncio.coroutine
-    def async_added_to_hass(self):
+    async def async_added_to_hass(self):
+        await super().async_added_to_hass()
         _LOGGER.info('Ekon climate device added to hass()')
         self.GetAndSync()

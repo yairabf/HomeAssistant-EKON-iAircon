@@ -58,10 +58,17 @@ This component is NOT CURRENTLY added to HACS default repository list.
      # Specify the name and password for your account
      username: my@account.com
      password: myPassword
+
+     # If you want to use an external temperature sensor
+     # humidity_sensor: <entity_id>
+
+     # If you want to use an external humidity sensor
+     # humidity_sensor: <entity_id>
+
      # This specifies the server that the component would work with, I have only tried it with EKON server (Airconet APP)
      # Optional, defults to Airconet server
      # Use this if you are using "Airconet" app - EKON main server
-     base_url: https://www.airconet.info/
+     base_url: https://www.activate-ac.com/
      # **UNTESTED** Alternative EKON tadiran server
      # base_url: https://www.airconet.xyz/
    ```
