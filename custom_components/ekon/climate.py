@@ -193,7 +193,7 @@ class EkonClimateController():
     """Ekon user account, inside this account there are all the ACs""" 
     def __init__(self, hass, async_add_devices, name, base_url, username, password, name_mapping, temperature_sensor, humidity_sensor):
         self._http_session = requests.Session()
-        self._hass = hass
+        self.hass = hass
         self._async_add_devices = async_add_devices
         self._name = name
         self._base_url = base_url
@@ -303,7 +303,7 @@ class EkonClimateController():
 
         #Retry?
         _LOGGER.info("ws_on_close() - Retry WS setup?")
-        self._hass.async_create_task(self.async_setup_ws())
+        self.hass.async_create_task(self.async_setup_ws())
 
 
     
@@ -319,7 +319,7 @@ class EkonClimateController():
         
     
     async def async_query_devices(self):
-        return await self._hass.async_add_executor_job(self.query_devices)
+        return await self.hass.async_add_executor_job(self.query_devices)
 
     # Returns JSON object
     def query_devices(self):
@@ -338,7 +338,7 @@ class EkonClimateController():
         return attch  
 
     async def async_do_login(self):
-        return await self._hass.async_add_executor_job(self.do_login)
+        return await self.hass.async_add_executor_job(self.do_login)
 
     def do_login(self):
         captcha = ''.join(random.choice(string.ascii_uppercase + string.digits) for _ in range(7))
@@ -407,7 +407,7 @@ class EkonClimate(ClimateEntity):
         self._mac_addr = _mac_addr
         self._temperature_sensor = controller._temperature_sensor
         self._humidity_sensor = controller._temperature_sensor
-        self._hass = controller._hass
+        self._hass = controller.hass
         self._target_temperature_step = 1
         # Ekon works with celsius only
         self._unit_of_measurement = TEMP_CELSIUS
