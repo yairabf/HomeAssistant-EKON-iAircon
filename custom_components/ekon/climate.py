@@ -406,7 +406,7 @@ class EkonClimate(ClimateEntity):
         self._name = name
         self._mac_addr = _mac_addr
         self._temperature_sensor = controller._temperature_sensor
-        self._humidity_sensor = controller._temperature_sensor
+        self._humidity_sensor = controller._humidity_sensor
         self._hass = controller.hass
         self._target_temperature_step = 1
         # Ekon works with celsius only
