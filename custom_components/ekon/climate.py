@@ -738,6 +738,5 @@ class EkonClimate(ClimateEntity):
             
     @asyncio.coroutine
     async def async_added_to_hass(self):
-        await super().async_added_to_hass()
         _LOGGER.info('Ekon climate device added to hass()')
         self.GetAndSync()
